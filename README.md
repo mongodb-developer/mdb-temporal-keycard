@@ -1,14 +1,37 @@
-# MongoDB × Temporal x Keycard —  Reference Architecture
+# MongoDB × Temporal × Keycard — Reference Architecture
 
-A production-grade reference implementation that shows how **Temporal** and **MongoDB Atlas** work
-together to build a durable, change-driven RAG pipeline with a deep-agent chat interface.
+A production-grade reference implementation that shows how **Temporal**, **MongoDB Atlas**, and
+**Keycard** work together to build a durable, change-driven RAG pipeline with a deep-agent chat
+interface.
 
 > **Developers:** see [docs/RUNBOOK.md](docs/RUNBOOK.md) for prerequisites, API key setup,
 > local spin-up, and cloud infra references.
 
 ---
 
-## What is Temporal?
+## The three pillars
+
+Every workflow in this repo uses all three systems together.
+
+| Concern                                                       | Owner                   |
+| ------------------------------------------------------------- | ----------------------- |
+| Orchestration, retries, checkpointing, backfill, resumability | **Temporal**            |
+| Operational data, vector index, agent memory & state          | **MongoDB Atlas**       |
+| Worker identity, just-in-time credentials, credential audit   | **Keycard**             |
+| Embeddings & reranking                                        | **MongoDB Voyage AI**   |
+| Agent reasoning & answers                                     | **OpenAI (Agents SDK)** |
+
+### What is MongoDB?
+
+MongoDB is a developer data platform for building modern applications. **MongoDB Atlas** unifies
+operational data, vector search, and application state so AI systems can retrieve fresh context and
+act on it in real time.
+
+In this architecture, Atlas is the single store both sides of the pipeline read and write: the
+ingestion workflow's embedded chunks and the agent's vector search + (future) memory all live in
+the same database, so there's no second copy and no sync lag.
+
+### What is Temporal?
 
 [Temporal](https://temporal.io) is a **durable execution platform**. It orchestrates long-running
 workflows as code — with automatic retries, checkpointing, and resume-on-failure built in. You
@@ -22,18 +45,32 @@ In this architecture Temporal owns two critical concerns:
 | Ingestion pipeline | A crash mid-embedding resumes from the last completed chunk — never re-embeds what is already done ([durable execution](https://docs.temporal.io/evaluate/major-advantages#fault-oblivious-code)) |
 | Agent workflows    | Multi-step agent plans are durable; a failure mid-conversation resumes without losing tool results or memory writes ([workflows as code](https://docs.temporal.io/workflows))                     |
 
+### What is Keycard?
+
+[Keycard](https://keycard.ai) is a **runtime identity and credential platform**. Instead of a
+worker (or a workflow's persisted history) holding a long-lived API key, Keycard gives the worker
+its own identity and mints a short-lived, scoped credential just before each activity or model call
+needs one, then that credential expires.
+
+Temporal guarantees a workflow finishes even after crashes and retries. Keycard makes sure each of
+those retries, which can happen minutes, hours, or days later, gets a fresh, valid credential
+instead of replaying a stale or revoked one from history. Without it, a static secret would sit in
+a system that persists and replays workflow history indefinitely.
+
 ---
 
 ## The problem this solves
 
-Customers hand-roll resilient ingestion/embedding pipelines and it hurts:
+Customers hand-roll resilient ingestion/embedding pipelines, and the credentials those pipelines
+run on cause just as much pain:
 
-| Customer   | Pain hand-rolled without Temporal                                        |
-| ---------- | ------------------------------------------------------------------------ |
-| Customer A | MD5 change-tracking in production to decide what to re-embed             |
-| Customer B | A homegrown "lambda clock" cron to generate embeddings                   |
-| Customer C | A FastAPI pipeline, hand-tuning sequential vs. parallel                  |
-| Customer D | A 5-hour import that fails on the last step **reruns the entire import** |
+| Customer   | Pain hand-rolled without Temporal + Keycard                               |
+| ---------- | --------------------------------------------------------------------------- |
+| Customer A | MD5 change-tracking in production to decide what to re-embed               |
+| Customer B | A homegrown "lambda clock" cron to generate embeddings                     |
+| Customer C | A FastAPI pipeline, hand-tuning sequential vs. parallel                    |
+| Customer D | A 5-hour import that fails on the last step **reruns the entire import**   |
+| Customer E | Static `MONGODB_URI` / API keys in `.env`, rotated by hand, that strand in-flight retries when revoked |
 
 This PRA packages the pattern that removes that pain — already in production at multiple enterprise customers.
 
@@ -45,16 +82,18 @@ This PRA packages the pattern that removes that pain — already in production a
 
 ![High-level architecture — Sources → Kafka → Temporal → Atlas → Deep Agent → User](docs/images/mongodb-temporal-hld-directtotemporal.svg)
 
-Temporal is used to bring durability to both the content ingestion pipeline and to the agent that leverages the ingested content.
+Temporal is used to bring durability to both the content ingestion pipeline and to the agent that leverages the ingested content. Every one of those Temporal-orchestrated steps that talks to Atlas, Voyage, or OpenAI does so with a credential Keycard minted for that specific activity or model call, not one pulled from `.env`.
 
 **How to read it:**
 
 1. Changes in **Data Soruces** (S3, RDBMS, messaging technologies, etc.) directly
    launch workflows running in Temporal
 2. **Temporal** chunks the content, calls **Voyage AI** for embeddings, and upserts into
-   **Atlas Search**.
+   **Atlas Search**, each call authenticated with a credential **Keycard** minted for that
+   activity.
 3. A **durable research agent** (OpenAI Agents SDK, running as a Temporal workflow) answers
-   questions over the fresh knowledge, using vector search + rerank (and web search) as tools.
+   questions over the fresh knowledge, using vector search + rerank (and web search) as tools,
+   its OpenAI key minted by **Keycard** per model call.
 
 > **Design note:** the direct trigger (i.e. S3 to the Ingestion Workflow) leverages
 > Temporal's durable execution to provide the "don't lose the event once the workflow starts"
@@ -62,13 +101,7 @@ Temporal is used to bring durability to both the content ingestion pipeline and 
 
 ### Division of responsibility
 
-| Concern                                                       | Owner                   |
-| ------------------------------------------------------------- | ----------------------- |
-| Orchestration, retries, checkpointing, backfill, resumability | **Temporal**            |
-| Operational data, vector index, agent memory & state          | **MongoDB Atlas**       |
-| Embeddings & reranking                                        | **MongoDB Voyage AI**   |
-| Agent reasoning & answers                                     | **OpenAI (Agents SDK)** |
-| Worker identity, just-in-time credentials, credential audit   | **Keycard**             |
+See [The three pillars](#the-three-pillars) above for the full breakdown of who owns what.
 
 ---
 
@@ -109,6 +142,11 @@ workflow to completion across retries, worker restarts, and infra maintenance.
   queue to scale horizontally.
 - **Output.** Embedded chunks land in `knowledge` with an Atlas Vector Search index, ready for the
   agent. Internals: `docs/LLD.md` §5–6.
+- **Credentials, minted not stored.** The Atlas connection string and the Voyage key used by the
+  fetch/stage/embed/index activities above aren't read from `.env`; each activity mints its own
+  from Keycard's vault the moment it starts, and that credential never appears in the workflow
+  history Temporal persists. See [Keycard](#keycard-runtime-credentials-for-the-pipeline-and-agent)
+  below for how.
 
 ### Ingestion sequence diagram
 
@@ -132,6 +170,10 @@ decides which to call, and how often.
   unfolds (step-level, not token streaming).
 - **Opt-in.** Loads only when `OPENAI_API_KEY` is set — ingestion runs without it. Full design:
   `docs/agent-retrieval.md`.
+- **Credentials, minted not stored.** In Keycard mode, the OpenAI key behind every model call is
+  minted per call by `KeycardOpenAIProvider`, and the vector-search/rerank activities mint their
+  Atlas and Voyage credentials the same way ingestion does. The agent's reasoning loop is
+  auditable in the Temporal UI, and so is every credential it used to get there.
 
 ### Sequence — research query
 
@@ -229,10 +271,10 @@ MONGODB_URI='mongodb+srv://...' VOYAGE_API_KEY='...' OPENAI_API_KEY='...' \
 # writes KEYCARD_* into .env; the three secrets above never land in .env
 ```
 
-### Where Keycard sits in the high-level design
+### Keycard in the high-level design
 
-For the architecture diagrams above, Keycard adds one box and annotates three
-existing edges; nothing else in the picture moves:
+Every edge in the diagrams above that leaves the Temporal worker carries a
+Keycard-minted credential, not a static one:
 
 ```mermaid
 flowchart LR
@@ -244,14 +286,13 @@ flowchart LR
     A --> AG[Deep research agent]
 ```
 
-- New box: **Keycard zone (identity + vault)**, attached to the Temporal
-  worker. The worker authenticates to it as an application; the three upstream
-  secrets live in its vault.
-- Annotated edges: **worker → Atlas** and **worker → Voyage** carry credentials
-  minted per activity execution (one `@grant` declares both); **worker →
-  OpenAI** carries keys minted per model call through the Keycard model
-  provider. No static keys ride any of these edges, and none appear in
-  workflow history.
+- **Keycard zone (identity + vault)**, attached to the Temporal worker. The
+  worker authenticates to it as an application; the three upstream secrets
+  live in its vault.
+- **worker → Atlas** and **worker → Voyage** carry credentials minted per
+  activity execution (one `@grant` declares both); **worker → OpenAI** carries
+  keys minted per model call through the Keycard model provider. No static
+  keys ride any of these edges, and none appear in workflow history.
 
 ---
 
@@ -331,7 +372,9 @@ mdb-temporal-pra/
 │   └── search_index.py             ← idempotent Atlas Vector Search management
 └── infra/
     ├── docker-compose.yml          ← MinIO (S3 events → webhook /ingest-event)
-    └── atlas_indexes.json          ← Vector Search index definitions
+    ├── atlas_indexes.json          ← Vector Search index definitions
+    ├── provision_keycard.py        ← one-time Keycard zone/app/vault setup
+    └── demo_policy.py              ← Keycard policy used by the kill-and-rotate demo
 ```
 
 ---
