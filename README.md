@@ -1,4 +1,4 @@
-# MongoDB × Temporal — Partner Reference Architecture
+# MongoDB × Temporal x Keycard —  Reference Architecture
 
 A production-grade reference implementation that shows how **Temporal** and **MongoDB Atlas** work
 together to build a durable, change-driven RAG pipeline with a deep-agent chat interface.
