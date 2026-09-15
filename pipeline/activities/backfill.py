@@ -11,11 +11,14 @@ from typing import Any
 
 from temporalio import activity
 
+from keycardai.temporal import grant
+
 from ..clients import knowledge_collection, voyage_client
 from ..config import settings
 from ..search_index import ensure_vector_index
 
 
+@grant(settings.keycard_mongodb_resource)
 @activity.defn
 def read_source_batch(after_id: str | None, limit: int, source_collection: str) -> list[dict[str, Any]]:
     """Read a page of chunks from the source collection, ascending by _id."""
@@ -33,6 +36,7 @@ def read_source_batch(after_id: str | None, limit: int, source_collection: str) 
     return out
 
 
+@grant(settings.keycard_mongodb_resource, settings.keycard_voyage_resource)
 @activity.defn
 def reembed_and_write(doc: dict[str, Any], model: str, target_collection: str) -> str:
     """Re-embed one chunk with the new model and upsert into the target collection."""
@@ -59,6 +63,7 @@ def reembed_and_write(doc: dict[str, Any], model: str, target_collection: str) -
     return doc["chunk_id"]
 
 
+@grant(settings.keycard_mongodb_resource)
 @activity.defn
 def ensure_target_index(target_collection: str, dim: int) -> bool:
     """Ensure the vector index exists on the target (green) collection at the new dim."""

@@ -8,6 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/research": "http://localhost:8090",
+      "/keycard": "http://localhost:8090",
       "/health": "http://localhost:8090",
     },
   },

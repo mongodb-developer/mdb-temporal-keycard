@@ -7,12 +7,15 @@ from typing import Any
 
 from temporalio import activity
 
+from keycardai.temporal import grant
+
 from pipeline.clients import knowledge_collection, voyage_client
 from pipeline.config import settings
 from pipeline.config_store import get_active
 from pipeline.retrieval import vector_search
 
 
+@grant(settings.keycard_mongodb_resource, settings.keycard_voyage_resource)
 @activity.defn
 def vector_search_tool(query: str, k: int = 10) -> list[dict[str, Any]]:
     """Semantic vector search over the active knowledge base.
@@ -32,6 +35,7 @@ def vector_search_tool(query: str, k: int = 10) -> list[dict[str, Any]]:
     ]
 
 
+@grant(settings.keycard_mongodb_resource, settings.keycard_voyage_resource)
 @activity.defn
 def rerank_tool(query: str, chunk_ids: list[str], top_k: int = 5) -> list[dict[str, Any]]:
     """Rerank candidate chunks for relevance to the query and keep the best `top_k`.

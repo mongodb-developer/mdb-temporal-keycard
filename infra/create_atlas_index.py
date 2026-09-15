@@ -136,5 +136,33 @@ def main() -> None:
     print("done. Index builds may take a minute; check status in the Atlas UI or list_search_indexes().")
 
 
+def _run_via_workflow() -> None:
+    """Keycard mode: run the bootstrap as a workflow so the Mongo credential is
+    minted per activity execution (requires `make start`, the worker)."""
+    import asyncio
+
+    from temporalio.client import Client
+
+    from pipeline.config import settings
+
+    async def go() -> None:
+        client = await Client.connect(
+            settings.temporal_address, namespace=settings.temporal_namespace
+        )
+        result = await client.execute_workflow(
+            "BootstrapIndexesWorkflow",
+            id="bootstrap-indexes",
+            task_queue=settings.temporal_task_queue,
+        )
+        print(f"bootstrap workflow completed: {result}")
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
-    main()
+    from pipeline.clients import keycard_enabled
+
+    if keycard_enabled():
+        _run_via_workflow()
+    else:
+        main()

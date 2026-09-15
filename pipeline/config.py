@@ -69,6 +69,17 @@ class Settings(BaseSettings):
     agent_model: str = "gpt-4.1"  # OpenAI model for the agent loop; adjust to a current one
     agent_max_turns: int = 8  # guardrail on the tool-use loop
 
+    # ---- Keycard (optional; see pipeline/clients.py and worker.py) ----
+    # Setting keycard_zone_url turns Keycard mode on: mongodb_uri,
+    # voyage_api_key, and openai_api_key above may then stay empty, and the
+    # secrets are minted just-in-time from the zone's vault instead.
+    keycard_zone_url: str = ""
+    keycard_client_id: str = ""
+    keycard_client_secret: str = ""
+    keycard_mongodb_resource: str = "https://cluster.mongodb.net"
+    keycard_voyage_resource: str = "https://api.voyageai.com"
+    keycard_openai_resource: str = "https://api.openai.com"
+
     # ---- Service ports ----
     trigger_api_port: int = 8088
     agent_api_port: int = 8090

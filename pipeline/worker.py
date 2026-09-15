@@ -26,11 +26,51 @@ async def main() -> None:
     # The durable research agent (OpenAI Agents SDK) is opt-in: it loads only when
     # OPENAI_API_KEY is set, because the plugin builds an OpenAI client at worker startup.
     # Without a key the worker still runs ingestion/backfill exactly as before.
+    from .clients import keycard_enabled
+
+    # Keycard mode: the interceptor mints a fresh credential for every activity
+    # execution (each activity declares its resources with @grant), so the
+    # upstream secrets never sit in .env or workflow history. The worker's own
+    # identity is the client-secret credential from settings, passed explicitly
+    # so nothing depends on process environment variables.
+    interceptors: list = []
+    credential = None
+    if keycard_enabled():
+        from keycardai.oauth.server import ClientSecret
+        from keycardai.temporal import KeycardInterceptor
+
+        credential = ClientSecret(
+            (settings.keycard_client_id, settings.keycard_client_secret)
+        )
+        interceptors.append(
+            KeycardInterceptor(settings.keycard_zone_url, credential=credential)
+        )
+        print(f"[worker] Keycard mode: credentials minted from {settings.keycard_zone_url}")
+
     plugins: list = []
     agent_workflows: list = []
     agent_activities: list = []
-    if settings.openai_api_key:
-        os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key)
+    # In Keycard mode the plugin's model credential comes from the Keycard
+    # model provider: the OpenAI key mints from the vault per model call
+    # (cached briefly), so rotation propagates without a worker restart and
+    # nothing is exported into the environment.
+    if credential is not None:
+        from keycardai.temporal.openai_agents import KeycardOpenAIProvider
+
+        plugins.append(
+            OpenAIAgentsPlugin(
+                model_params=ModelActivityParameters(
+                    start_to_close_timeout=timedelta(seconds=60)
+                ),
+                model_provider=KeycardOpenAIProvider(
+                    settings.keycard_zone_url,
+                    settings.keycard_openai_resource,
+                    credential=credential,
+                ),
+            )
+        )
+    elif settings.openai_api_key:
+        os.environ["OPENAI_API_KEY"] = settings.openai_api_key
         plugins.append(
             OpenAIAgentsPlugin(
                 model_params=ModelActivityParameters(
@@ -38,6 +78,7 @@ async def main() -> None:
                 )
             )
         )
+    if plugins:
         agent_workflows = [DeepResearchAgent]
         agent_activities = [vector_search_tool, rerank_tool]
     else:
@@ -58,6 +99,7 @@ async def main() -> None:
             workflows=[*ALL_WORKFLOWS, *agent_workflows],
             activities=[*ALL_ACTIVITIES, *agent_activities],
             activity_executor=executor,
+            interceptors=interceptors,
         )
         print(
             f"[worker] connected to {settings.temporal_address} "

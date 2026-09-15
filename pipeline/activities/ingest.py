@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from temporalio import activity
 
+from keycardai.temporal import grant
+
 from ..clients import knowledge_collection, mongo_client, s3_client, voyage_client
 from ..config import settings
 from ..extractors import get_extractor
@@ -22,6 +24,7 @@ def _staging():
     return mongo_client()[settings.mongodb_db][settings.chunks_collection]
 
 
+@grant(settings.keycard_mongodb_resource)
 @activity.defn
 def fetch_and_stage_chunks(ref: S3Ref) -> dict:
     """Stage 1: download, extract+chunk by file type, persist chunks to MDB (batched)."""
@@ -64,6 +67,7 @@ def fetch_and_stage_chunks(ref: S3Ref) -> dict:
     return {"doc_id": doc_id, "doc_hash": doc_hash, "n": len(raws), "status": "staged", "extractor": extractor.name}
 
 
+@grant(settings.keycard_mongodb_resource, settings.keycard_voyage_resource)
 @activity.defn
 def embed_staged_chunk(chunk_id: str, model: str | None = None) -> str:
     """Stage 2: embed one staged chunk (idempotent — skips if already embedded with this model)."""
@@ -84,6 +88,7 @@ def embed_staged_chunk(chunk_id: str, model: str | None = None) -> str:
     return chunk_id
 
 
+@grant(settings.keycard_mongodb_resource)
 @activity.defn
 def index_document(doc_id: str, doc_hash: str, target_collection: str | None = None) -> dict:
     """Stage 3: upsert embedded chunks into the searchable collection; update in place."""

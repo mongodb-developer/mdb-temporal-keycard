@@ -9,12 +9,14 @@ exposed via the `progress` query (run hooks append human-readable steps as the a
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from agents import Agent, RunHooks, Runner, WebSearchTool
+    from agents import Agent, FunctionTool, RunHooks, Runner, WebSearchTool
     from temporalio.contrib.openai_agents.workflow import activity_as_tool
 
     from pipeline.config import settings
@@ -37,8 +39,44 @@ _INSTRUCTIONS = (
     "how Temporal works — prefer them over the open web when they conflict.\n"
     "- Answer from your gathered sources. Cite inline as [n]: give the source_uri for "
     "knowledge-base chunks and the URL for web results, address each sub-topic, and make clear "
-    "which claims came from the docs vs the web. If neither contains the answer, say so plainly."
+    "which claims came from the docs vs the web. If neither contains the answer, say so plainly.\n"
+    "- If `vector_search_tool` or `rerank_tool` returns ACCESS DENIED BY KEYCARD POLICY, your answer "
+    "MUST begin with this exact sentence: \"My access to the internal knowledge base has been "
+    "revoked by Keycard policy.\" Do not retry the tool and do not ask for confirmation: go straight "
+    "to web search, answer from those results alone, and mark every claim as web-sourced."
 )
+
+
+def _denial_as_tool_result(tool: FunctionTool, on_denied) -> FunctionTool:
+    """Hand a Keycard policy denial to the model instead of failing the run.
+
+    The worker's KeycardInterceptor raises the non-retryable KeycardAccessDenied
+    before the tool body runs. Left alone, that aborts the whole agent workflow
+    before the model hears about it. Returned as the tool's result, the agent
+    can say what happened and fall back to the web. Every other failure still
+    raises and retries under the activity policy.
+
+    `on_denied(message)` runs in workflow context so the workflow can record the
+    denial itself; the recorded activity failure drives it, so it replays
+    deterministically.
+    """
+    inner = tool.on_invoke_tool
+
+    async def on_invoke(ctx, input):  # signature fixed by the Agents SDK
+        try:
+            return await inner(ctx, input)
+        except ActivityError as e:
+            cause = e.cause
+            if isinstance(cause, ApplicationError) and cause.type == "KeycardAccessDenied":
+                on_denied(cause.message or "")
+                return f"ACCESS DENIED BY KEYCARD POLICY: {cause.message}"
+            raise
+
+    return dataclasses.replace(tool, on_invoke_tool=on_invoke)
+
+
+_DENIED_STEP = "Knowledge base access denied by Keycard policy"
+
 
 # Human-readable progress labels keyed by tool name/type.
 _TOOL_LABELS = {
@@ -80,6 +118,7 @@ class DeepResearchAgent:
         self._tool_calls: list[str] = []
         self._answer: str | None = None
         self._done: bool = False
+        self._denials: list[str] = []
 
     @workflow.query
     def progress(self) -> dict:
@@ -90,6 +129,7 @@ class DeepResearchAgent:
             "answer": self._answer,
             "model": settings.agent_model,
             "done": self._done,
+            "denials": list(self._denials),
         }
 
     @workflow.run
@@ -99,10 +139,16 @@ class DeepResearchAgent:
             model=settings.agent_model,
             instructions=_INSTRUCTIONS,
             tools=[
-                activity_as_tool(
-                    vector_search_tool, start_to_close_timeout=timedelta(seconds=30)
+                _denial_as_tool_result(
+                    activity_as_tool(
+                        vector_search_tool, start_to_close_timeout=timedelta(seconds=30)
+                    ),
+                    self._record_denial,
                 ),
-                activity_as_tool(rerank_tool, start_to_close_timeout=timedelta(seconds=30)),
+                _denial_as_tool_result(
+                    activity_as_tool(rerank_tool, start_to_close_timeout=timedelta(seconds=30)),
+                    self._record_denial,
+                ),
                 # Hosted tool: runs inside the model-call activity (OpenAI Responses API),
                 # not as a separate Temporal activity. Requires a web-search-capable model.
                 WebSearchTool(),
@@ -127,6 +173,9 @@ class DeepResearchAgent:
         except Exception:  # noqa: BLE001 - trajectory is diagnostic only
             self._tool_calls = []
 
+        # Denials are reported in `denials` (progress query and result), recorded by
+        # the workflow rather than the model, so the record is exact even when the
+        # model glosses over the refusal or finds the same material on the open web.
         self._answer = result.final_output
         self._done = True
         self._add_final_step()
@@ -135,7 +184,13 @@ class DeepResearchAgent:
             "answer": self._answer,
             "model": settings.agent_model,
             "tool_calls": list(self._tool_calls),
+            "denials": list(self._denials),
         }
+
+    def _record_denial(self, message: str) -> None:
+        self._denials.append(message)
+        if not self._steps or self._steps[-1] != _DENIED_STEP:
+            self._steps.append(_DENIED_STEP)
 
     def _add_final_step(self) -> None:
         if not self._steps or self._steps[-1] != "Done":
